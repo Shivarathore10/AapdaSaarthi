@@ -1,3 +1,5 @@
+import torch
+import torch.nn as nn
 import os
 import io
 import json
@@ -51,8 +53,138 @@ div.stButton>button{background:linear-gradient(90deg,#42cbd5,#8debc2);color:#061
 CATALOGUE_URL = "https://sh.dataspace.copernicus.eu/catalog/v1/search"
 TOKEN_URL = "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
 PROCESS_URL = "https://sh.dataspace.copernicus.eu/process/v1"
-RUN_ROOT = Path("/content/AapdaSaarthi_Results")
-RUN_ROOT.mkdir(exist_ok=True)
+RUN_ROOT = Path(__file__).resolve().parent / "AapdaSaarthi_Results"
+RUN_ROOT.mkdir(parents=True, exist_ok=True)
+
+# ==========================================
+# U-NET FLOOD DETECTION - ADDITIONAL FEATURE
+# ==========================================
+
+class FloodDoubleConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class FloodUNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.enc1 = FloodDoubleConv(2, 16)
+        self.enc2 = FloodDoubleConv(16, 32)
+        self.enc3 = FloodDoubleConv(32, 64)
+        self.enc4 = FloodDoubleConv(64, 128)
+
+        self.pool = nn.MaxPool2d(2)
+
+        self.bottleneck = FloodDoubleConv(128, 256)
+
+        self.up4 = nn.ConvTranspose2d(256, 128, 2, stride=2)
+        self.dec4 = FloodDoubleConv(256, 128)
+
+        self.up3 = nn.ConvTranspose2d(128, 64, 2, stride=2)
+        self.dec3 = FloodDoubleConv(128, 64)
+
+        self.up2 = nn.ConvTranspose2d(64, 32, 2, stride=2)
+        self.dec2 = FloodDoubleConv(64, 32)
+
+        self.up1 = nn.ConvTranspose2d(32, 16, 2, stride=2)
+        self.dec1 = FloodDoubleConv(32, 16)
+
+        self.out = nn.Conv2d(16, 2, 1)
+
+    def forward(self, x):
+
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        e4 = self.enc4(self.pool(e3))
+
+        b = self.bottleneck(self.pool(e4))
+
+        d4 = self.dec4(torch.cat([self.up4(b), e4], dim=1))
+        d3 = self.dec3(torch.cat([self.up3(d4), e3], dim=1))
+        d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1))
+        d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
+
+        return self.out(d1)
+
+
+@st.cache_resource
+def load_flood_unet(checkpoint_path, checkpoint_mtime):
+
+    model = FloodUNet()
+
+    state_dict = torch.load(
+        checkpoint_path,
+        map_location="cpu",
+        weights_only=True
+    )
+
+    model.load_state_dict(state_dict, strict=True)
+    model.eval()
+
+    return model
+
+
+def predict_flood(post_sar, model):
+
+    image = np.asarray(post_sar, dtype=np.float32)
+
+    if image.ndim != 3 or image.shape[0] != 2:
+        raise ValueError("Model requires 2 input bands: VV and VH.")
+
+    if image.shape[1:] != (512, 512):
+        raise ValueError("Model requires a 512 x 512 image.")
+
+    valid = np.isfinite(image).all(axis=0)
+
+    normalized = np.zeros_like(image, dtype=np.float32)
+
+    # Same per-band normalization used during training
+    for band in range(2):
+
+        x = image[band]
+        values = x[valid]
+
+        if values.size:
+            mean = values.mean()
+            std = values.std()
+
+            if std > 1e-6:
+                normalized[band, valid] = (
+                    values - mean
+                ) / std
+
+    tensor = torch.from_numpy(
+        normalized.copy()
+    ).unsqueeze(0).float()
+
+    with torch.inference_mode():
+
+        logits = model(tensor)
+
+        probabilities = torch.softmax(
+            logits, dim=1
+        )
+
+        flood_probability = (
+            probabilities[0, 1].numpy()
+        )
+
+    flood_probability[~valid] = np.nan
+
+    return flood_probability, valid
+
 
 def hero():
     st.markdown("""
@@ -89,7 +221,12 @@ def geocode_place(place):
 def search_scenes(token, bbox, start_date, end_date, max_cloud=100):
     start = datetime.combine(start_date, datetime.min.time(), tzinfo=timezone.utc).isoformat().replace("+00:00","Z")
     end = datetime.combine(end_date, datetime.max.time(), tzinfo=timezone.utc).isoformat().replace("+00:00","Z")
-    payload = {"collections":["sentinel-1-grd"],"bbox":bbox,"datetime":f"{start}/{end}","limit":100}
+    payload = {
+    "collections": ["sentinel-1-grd"],
+    "bbox": bbox,
+    "datetime": f"{start}/{end}",
+    "limit": 100
+}
     r = requests.post(CATALOGUE_URL, headers={"Authorization":f"Bearer {token}","Content-Type":"application/json"}, json=payload, timeout=90)
     r.raise_for_status()
     features = r.json().get("features",[])
@@ -104,30 +241,60 @@ def search_scenes(token, bbox, start_date, end_date, max_cloud=100):
             "mode":p.get("sar:instrument_mode"),"polarizations":pol,
             "platform":p.get("platform"),"bbox":f.get("bbox")
         })
+        print("Total scenes found:", len(rows))
+        print("Available polarizations:", [x for x in rows[:10]])
     return pd.DataFrame(rows)
+
 
 def choose_pair(df, pre_date, post_date):
     if df.empty:
         return None
-    d=df.copy()
-    d["dt"]=pd.to_datetime(d["datetime"],utc=True)
-    d=d[d["polarizations"].apply(lambda x: "VV" in x and "VH" in x)]
-    pre=d[d["dt"].dt.date <= pre_date].copy()
-    post=d[d["dt"].dt.date >= post_date].copy()
-    candidates=[]
-    for _,a in pre.iterrows():
-        for _,b in post.iterrows():
-            if a["orbit"] != b["orbit"] or a["direction"] != b["direction"] or a["mode"] != b["mode"]:
+
+    d = df.copy()
+    d["dt"] = pd.to_datetime(d["datetime"], utc=True)
+
+    d = d[
+        d["polarizations"].apply(
+            lambda x: "VV" in x and "VH" in x
+        )
+    ]
+
+    pre = d[d["dt"].dt.date <= pre_date].copy()
+    post = d[d["dt"].dt.date >= post_date].copy()
+
+    candidates = []
+
+    for _, a in pre.iterrows():
+        for _, b in post.iterrows():
+
+            if (
+                a["orbit"] != b["orbit"]
+                or a["direction"] != b["direction"]
+                or a["mode"] != b["mode"]
+            ):
                 continue
-            gap=(b["dt"]-a["dt"]).total_seconds()/86400
-            if gap <= 0: continue
-            score=abs((a["dt"].date()-pre_date).days)+abs((b["dt"].date()-post_date).days)
-            candidates.append((score,gap,a,b))
+
+            gap = (b["dt"] - a["dt"]).total_seconds() / 86400
+
+            if gap <= 0:
+                continue
+
+            score = (
+                abs((a["dt"].date() - pre_date).days)
+                + abs((b["dt"].date() - post_date).days)
+            )
+
+            candidates.append((score, gap, a, b))
+
     if not candidates:
         return None
-    candidates.sort(key=lambda x:(x[0],x[1]))
-    _,_,a,b=candidates[0]
-    return a.to_dict(),b.to_dict()
+
+    candidates.sort(key=lambda x: (x[0], x[1]))
+
+    _, _, a, b = candidates[0]
+
+    return a.to_dict(), b.to_dict()
+
 
 def process_scene(token, bbox, scene):
     stamp=pd.Timestamp(scene["datetime"]).to_pydatetime()
@@ -142,7 +309,10 @@ function evaluatePixel(s){return [s.VV,s.VH];}"""
         "evalscript":evalscript
     }
     r=requests.post(PROCESS_URL,headers={"Authorization":f"Bearer {token}","Content-Type":"application/json"},json=body,timeout=180)
-    r.raise_for_status()
+    if r.status_code != 200:
+     print("CDSE STATUS:", r.status_code)
+     print("CDSE ERROR:", r.text)
+     r.raise_for_status()
     return r.content
 
 def read_tiff(blob):
@@ -351,7 +521,7 @@ if page=="Live Assessment":
             try:
                 with st.status("Connecting to Copernicus Data Space…",expanded=True) as status:
                     token=get_token();st.write("Authentication successful.")
-                    scenes=search_scenes(token,st.session_state.bbox,pre_date-timedelta(days=4),post_date+timedelta(days=4))
+                    scenes=search_scenes(token,st.session_state.bbox,pre_date-timedelta(days=15),post_date+timedelta(days=15))
                     st.write(f"Catalogue returned {len(scenes)} Sentinel-1 scenes.")
                     pair=choose_pair(scenes,pre_date,post_date)
                     if not pair: raise RuntimeError("No compatible PRE/POST Sentinel-1 pair found. Try widening the date range or AOI.")
@@ -452,20 +622,207 @@ elif page=="Candidate Regions":
     if not assessment: st.warning("Run a Live Assessment first.")
     else:
         r=assessment["result"];mask=r["mask"];labels,n=ndimage.label(mask,structure=np.ones((3,3),dtype=np.uint8))
-        counts=np.bincount(labels.ravel());ids=np.where(counts>0)[0];ids=ids[ids!=0]
-        rows=[]
-        for idx in ids:
-            rr,cc=np.where(labels==idx)
-            rows.append({"Region ID":int(idx),"Pixels":int(len(rr)),"Centroid row":round(float(rr.mean()),1),"Centroid column":round(float(cc.mean()),1),"Share of candidates %":round(100*len(rr)/max(mask.sum(),1),2)})
-        table=pd.DataFrame(rows).sort_values("Pixels",ascending=False) if rows else pd.DataFrame(columns=["Region ID","Pixels","Centroid row","Centroid column","Share of candidates %"])
-        c1,c2,c3=st.columns(3)
-        c1.metric("Raw candidate pixels",f"{int(r['raw'].sum()):,}")
-        c2.metric("Filtered candidate pixels",f"{int(mask.sum()):,}")
-        c3.metric("Retained regions",f"{len(ids):,}")
-        st.dataframe(table,use_container_width=True,height=350)
-        mask_col=st.columns([1,8,1])[1]
-        with mask_col:
-            st.image(png_overlay(mask.astype(float),r["valid"],"mask"),caption="Filtered SAR change candidates",width=850)
+
+
+         
+        # ==========================================
+        # NEW FEATURE: U-NET FLOOD DETECTION
+        # ==========================================
+
+        st.markdown("### AI Flood Detection - U-Net")
+
+        st.caption(
+            "Additional flood segmentation using the trained "
+            "Sen1Floods11 U-Net model."
+        )
+
+        checkpoint_path = (
+            Path(__file__).resolve().parent
+            / "unet_weight3_best.pth"
+        )
+
+        threshold = st.slider(
+            "Flood probability threshold",
+            min_value=0.10,
+            max_value=0.90,
+            value=0.50,
+            step=0.05,
+            key="flood_threshold"
+        )
+
+     
+
+        if st.button(
+            "Run U-Net Flood Detection",
+            type="primary",
+            disabled=not checkpoint_path.exists()
+        ):
+
+            try:
+
+                with st.spinner("Running U-Net prediction..."):
+
+                    model = load_flood_unet(
+                        str(checkpoint_path),
+                        checkpoint_path.stat().st_mtime_ns
+                    )
+
+                    post_path = (
+                        Path(assessment["folder"])
+                        / "POST_SAR.tif"
+                    )
+
+                    with rasterio.open(post_path) as src:
+                        post_sar = src.read().astype(np.float32)
+
+                    probability, valid = predict_flood(
+                        post_sar, model
+                    )
+
+                    st.session_state["flood_probability"] = probability
+                    st.session_state["flood_valid"] = valid
+                    st.session_state["flood_folder"] = assessment["folder"]
+
+                st.success("U-Net prediction completed!")
+
+            except Exception as e:
+
+                st.error(f"U-Net prediction failed: {e}")
+
+        probability = st.session_state.get("flood_probability")
+        valid = st.session_state.get("flood_valid")
+
+        if (
+            probability is not None
+            and valid is not None
+            and st.session_state.get("flood_folder") == assessment["folder"]
+        ):
+
+            flood_mask = (probability >= threshold) & valid
+
+            total_pixels = int(valid.sum())
+            flood_pixels = int(flood_mask.sum())
+            non_flood_pixels = total_pixels - flood_pixels
+
+            flood_percentage = (
+                100 * flood_pixels / max(total_pixels, 1)
+            )
+
+            non_flood_percentage = (
+                100 - flood_percentage
+            )
+
+            st.markdown("#### U-Net Prediction Results")
+
+            c1, c2, c3 = st.columns(3)
+
+            c1.metric("Flood Pixels", f"{flood_pixels:,}")
+            c2.metric("Non-Flood Pixels", f"{non_flood_pixels:,}")
+            c3.metric("Flood Percentage", f"{flood_percentage:.2f}%")
+
+            # Original SAR image
+            post_vv = post_sar[0] if "post_sar" in locals() else None
+
+            if post_vv is None:
+                with rasterio.open(
+                    Path(assessment["folder"]) / "POST_SAR.tif"
+                ) as src:
+                    post_vv = src.read(1)
+
+            visual_cols = st.columns(3)
+
+            with visual_cols[0]:
+
+                st.image(
+                    png_overlay(post_vv, valid, "gray"),
+                    caption="Original POST SAR - VV",
+                    use_container_width=True
+                )
+
+            with visual_cols[1]:
+
+                mask_display = np.zeros(
+                    (*flood_mask.shape, 3),
+                    dtype=np.uint8
+                )
+
+                mask_display[valid & ~flood_mask] = [22, 163, 74]
+                mask_display[flood_mask] = [37, 99, 235]
+
+                st.image(
+                    mask_display,
+                    caption="Flood / Non-Flood Mask",
+                    use_container_width=True
+                )
+
+            with visual_cols[2]:
+
+                overlay = np.repeat(
+                    (np.clip(
+                        (post_vv - np.nanmin(post_vv[valid])) /
+                        max(
+                            np.nanmax(post_vv[valid]) -
+                            np.nanmin(post_vv[valid]), 1e-6
+                        ),
+                        0, 1
+                    )[..., None] * 255).astype(np.uint8),
+                    3,
+                    axis=2
+                )
+
+                overlay[flood_mask] = [255, 50, 60]
+
+                st.image(
+                    overlay,
+                    caption="Flood Overlay",
+                    use_container_width=True
+                )
+
+            st.progress(
+                flood_percentage / 100,
+                text=f"Predicted flooded pixels: {flood_percentage:.2f}%"
+            )
+
+            st.caption(
+                "Red = predicted flood. "
+                "Light = predicted non-flood. "
+                "Predictions are experimental, not verified flood boundaries."
+            )
+
+            # Save GeoTIFF outputs
+            profile = assessment["profile"]
+            processed_dir = Path(assessment["folder"]) / "processed"
+
+            flood_output = flood_mask.astype(np.float32)
+            flood_output[~valid] = np.nan
+
+            write_geotiff(
+                processed_dir / "UNet_Flood_Mask.tif",
+                flood_output,
+                profile,
+                -9999
+            )
+
+            probability_output = probability.astype(np.float32)
+
+            write_geotiff(
+                processed_dir / "UNet_Flood_Probability.tif",
+                probability_output,
+                profile,
+                -9999
+            )
+            st.markdown("### Flood Classification")
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+               st.markdown("🔵 **Flooded Area**")
+
+            with col2:
+              st.markdown("🟢 **Non-Flooded Area**")
+
+
+
 
 elif page=="Validation & Quality":
     st.subheader("Validation and quality assurance")
